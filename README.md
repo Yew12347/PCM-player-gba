@@ -30,3 +30,6 @@ pip install pillow
 ```
 3. cd to pcm player source(im not telling this basic of a thing bro)
 4. run make
+
+# How to use
+use gbfs tool to create gbfs of RAW pcm_s8 files and it will automaticly play them
