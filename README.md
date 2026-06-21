@@ -6,8 +6,8 @@ play pcm file on a gba Built on top of a patched version of butano engine
 this project is still wip and only work on mgba on hardware it just not a song
 
 # How to build
-1.install devkitpro or devkitarm up to os
-2.install pillow python package
+1. install devkitpro or devkitarm up to os
+2. install pillow python package
 ```sh
 # For MSYS2/MinGW-w64 users
 pacman -S mingw-w64-x86_64-python-pillow
@@ -28,5 +28,5 @@ or on windows
 ```cmd
 pip install pillow
 ```
-3.cd to pcm player source(im not telling this basic of a thing bro)
-4.run make
+3. cd to pcm player source(im not telling this basic of a thing bro)
+4. run make
