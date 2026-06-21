@@ -26,6 +26,9 @@ static char current_song_name[64] = {0};
 static bool select_locked = false;
 static bool paused = false;
 
+// Tracks the absolute seek position since direct_audio_play resets the internal counter
+static uint32_t current_song_offset = 0; 
+
 // ---------------- UI ----------------
 bn::sprite_text_generator text_gen(unifont_sprite_font);
 
@@ -158,6 +161,8 @@ static void start_song()
 
     hud_new_song(current_song_name);
 
+    current_song_offset = 0; // Reset tracking offset for new song
+
     if(src && src_len > 0)
         bn::core::direct_audio_play(src, src_len);
 }
@@ -186,7 +191,8 @@ int main()
 
     while(true)
     {
-        uint32_t current_offset = bn::core::direct_audio_get_offset();
+        // Calculate current location as base offset + current relative play progress
+        uint32_t current_offset = current_song_offset + bn::core::direct_audio_get_offset();
 
         // INPUT
         if(bn::keypad::select_pressed())
@@ -200,45 +206,79 @@ int main()
                 bn::core::direct_audio_pause_toggle();
             }
 
-            if(!paused)
+            // Seek backward (B button)
+            if(bn::keypad::b_pressed())
             {
-                if(bn::keypad::b_pressed())
-                {
-                    int32_t target = current_offset - (2 * SAMPLE_RATE);
+                int32_t target = current_offset - (2 * SAMPLE_RATE);
 
-                    if(target < 0)
-                    {
-                        cur_song = (cur_song == 0) ? gbfs_total - 1 : cur_song - 1;
-                        start_song();
-                    }
-                    else
-                        bn::core::direct_audio_set_offset(target);
-                }
-
-                if(bn::keypad::a_pressed())
-                {
-                    uint32_t target = current_offset + (2 * SAMPLE_RATE);
-
-                    if(target >= src_len)
-                    {
-                        cur_song = (cur_song + 1) % gbfs_total;
-                        start_song();
-                    }
-                    else
-                        bn::core::direct_audio_set_offset(target);
-                }
-
-                if(bn::keypad::right_pressed())
-                {
-                    cur_song = (cur_song + 1) % gbfs_total;
-                    start_song();
-                }
-
-                if(bn::keypad::left_pressed())
+                if(target < 0)
                 {
                     cur_song = (cur_song == 0) ? gbfs_total - 1 : cur_song - 1;
                     start_song();
+                    
+                    if(paused)
+                    {
+                        bn::core::direct_audio_pause_toggle();
+                    }
                 }
+                else
+                {
+                    bool was_paused = paused;
+
+                    bn::core::direct_audio_stop();
+                    current_song_offset = target;
+                    bn::core::direct_audio_play(src + target, src_len - target);
+
+                    if(was_paused)
+                    {
+                        bn::core::direct_audio_pause_toggle();
+                    }
+                }
+            }
+
+            // Seek forward (A button)
+            if(bn::keypad::a_pressed())
+            {
+                uint32_t target = current_offset + (2 * SAMPLE_RATE);
+
+                if(target >= src_len)
+                {
+                    cur_song = (cur_song + 1) % gbfs_total;
+                    start_song();
+                    
+                    if(paused)
+                    {
+                        bn::core::direct_audio_pause_toggle();
+                    }
+                }
+                else
+                {
+                    bool was_paused = paused;
+
+                    bn::core::direct_audio_stop();
+                    current_song_offset = target;
+                    bn::core::direct_audio_play(src + target, src_len - target);
+
+                    if(was_paused)
+                    {
+                        bn::core::direct_audio_pause_toggle();
+                    }
+                }
+            }
+
+            // Track changes
+            if(bn::keypad::right_pressed())
+            {
+                paused = false;
+                cur_song = (cur_song + 1) % gbfs_total;
+                start_song();
+            }
+
+            if(bn::keypad::left_pressed())
+            {
+                paused = false;
+                cur_song = (cur_song == 0) ? gbfs_total - 1 : cur_song - 1;
+                start_song();
             }
         }
 
