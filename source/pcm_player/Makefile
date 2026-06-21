@@ -55,3 +55,6 @@ endif
 # Include main makefile:
 #---------------------------------------------------------------------------------------------------------------------
 include $(LIBBUTANOABS)/butano.mak
+
+$(TARGET).gba::
+	padbin 256 $@
