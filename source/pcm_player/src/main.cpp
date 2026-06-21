@@ -10,10 +10,12 @@
 
 #include <stdint.h>
 
+// ---------------- CONFIGURATION ----------------
+static constexpr int TEXT_GAP = 64; // Adjust this value to increase/decrease marquee text spacing
+
 // ---------------- STATE ----------------
 static const GBFS_FILE* gbfs = nullptr;
 static const uint8_t* src = nullptr;
-static const uint8_t* src_end = nullptr;
 static uint32_t src_len = 0;
 
 static int cur_song = 0;
@@ -29,21 +31,24 @@ bn::sprite_text_generator text_gen(unifont_sprite_font);
 
 bn::vector<bn::sprite_ptr, 32> static_ui_sprites;
 bn::vector<bn::sprite_ptr, 32> track_sprites;
+bn::vector<bn::sprite_ptr, 32> track_sprites_2;
 bn::vector<bn::sprite_ptr, 16> dynamic_ui_sprites;
 
 // ---------------- SCROLL ----------------
 bn::vector<bn::fixed, 32> track_base_xs;
+bn::vector<bn::fixed, 32> track_base_xs_2;
+
 bn::fixed track_scroll_x = 0;
 bn::fixed track_scroll_speed = 0.6;
 
-// ---------------- AUDIO FORMAT ----------------
-// PCM signed 8-bit mono @ 16000 Hz
+static int text_width = 0;
+
+// ---------------- AUDIO ----------------
 static constexpr uint32_t SAMPLE_RATE = 16000;
 
-// ---------------- TIME (FIXED) ----------------
+// ---------------- TIME ----------------
 static void decimal_time(char* dst, uint32_t byte_offset)
 {
-    // 1 byte = 1 sample (8-bit PCM mono)
     uint32_t total_seconds = byte_offset / SAMPLE_RATE;
 
     if(total_seconds > 5999)
@@ -58,37 +63,59 @@ static void decimal_time(char* dst, uint32_t byte_offset)
     *dst++ = '0' + (s % 10);
 }
 
-// ---------------- HUD STATIC ----------------
+// ---------------- HUD ----------------
 static void init_hud_static_text()
 {
     static_ui_sprites.clear();
     text_gen.set_left_alignment();
 
     text_gen.generate(-110, -65, "PCM Player for GBA", static_ui_sprites);
-    text_gen.generate(-110, -50, "Copr. 2026, 2026", static_ui_sprites);
+    text_gen.generate(-110, -50, "Copr. 2026", static_ui_sprites);
     text_gen.generate(-110, -35, "by yewgamer", static_ui_sprites);
     text_gen.generate(-110, 15, "Playing", static_ui_sprites);
 }
 
-// ---------------- SONG TITLE ----------------
+// ---------------- SONG TITLE (FIXED LOOP) ----------------
 static void hud_new_song(const char* name)
 {
     init_hud_static_text();
 
     track_sprites.clear();
+    track_sprites_2.clear();
     track_base_xs.clear();
+    track_base_xs_2.clear();
+
     track_scroll_x = 0;
 
     text_gen.set_left_alignment();
+
+    // FIRST COPY
     text_gen.generate(-110, 30, name, track_sprites);
 
-    for(int i = 0, size = track_sprites.size(); i < size; ++i)
+    int min_x = 99999;
+    int max_x = -99999;
+
+    for(int i = 0; i < track_sprites.size(); ++i)
     {
+        int x = track_sprites[i].x().integer();
         track_base_xs.push_back(track_sprites[i].x());
+
+        min_x = bn::min(min_x, x);
+        max_x = bn::max(max_x, x);
+    }
+
+    text_width = max_x - min_x;
+
+    // SECOND COPY
+    text_gen.generate(-110, 30, name, track_sprites_2);
+
+    for(int i = 0; i < track_sprites_2.size(); ++i)
+    {
+        track_base_xs_2.push_back(track_sprites_2[i].x() + text_width + TEXT_GAP);
     }
 }
 
-// ---------------- STATUS LINE ----------------
+// ---------------- STATUS ----------------
 static char status_buffer[32];
 
 static void hud_update_frame(bool locked, bool is_paused, int track_index, uint32_t byte_offset)
@@ -127,15 +154,12 @@ static void hud_update_frame(bool locked, bool is_paused, int track_index, uint3
 // ---------------- SONG START ----------------
 static void start_song()
 {
-    src = (const uint8_t*)gbfs_get_nth_obj(gbfs, cur_song, current_song_name, &src_len);
-    src_end = src + src_len;
+    src = (const uint8_t*) gbfs_get_nth_obj(gbfs, cur_song, current_song_name, &src_len);
 
     hud_new_song(current_song_name);
 
     if(src && src_len > 0)
-    {
         bn::core::direct_audio_play(src, src_len);
-    }
 }
 
 // ---------------- MAIN ----------------
@@ -148,16 +172,14 @@ int main()
     if(!gbfs)
     {
         text_gen.set_left_alignment();
-        text_gen.generate(-110, 10, "Please append gbfs file", static_ui_sprites);
+        text_gen.generate(-110, 10, "No GBFS file", static_ui_sprites);
         while(true) bn::core::update();
     }
 
     gbfs_total = gbfs_count_objs(gbfs);
 
     for(int i = 0; i < 60; ++i)
-    {
         bn::core::update();
-    }
 
     init_hud_static_text();
     start_song();
@@ -166,11 +188,9 @@ int main()
     {
         uint32_t current_offset = bn::core::direct_audio_get_offset();
 
-        // ---------------- INPUT ----------------
+        // INPUT
         if(bn::keypad::select_pressed())
-        {
             select_locked = !select_locked;
-        }
 
         if(!select_locked)
         {
@@ -182,34 +202,30 @@ int main()
 
             if(!paused)
             {
-                // B Button: Skip backward 2 seconds
                 if(bn::keypad::b_pressed())
                 {
-                    int32_t target = static_cast<int32_t>(current_offset) - (2 * SAMPLE_RATE);
+                    int32_t target = current_offset - (2 * SAMPLE_RATE);
+
                     if(target < 0)
                     {
                         cur_song = (cur_song == 0) ? gbfs_total - 1 : cur_song - 1;
                         start_song();
                     }
                     else
-                    {
-                        bn::core::direct_audio_set_offset(static_cast<uint32_t>(target));
-                    }
+                        bn::core::direct_audio_set_offset(target);
                 }
 
-                // A Button: Skip forward 2 seconds
                 if(bn::keypad::a_pressed())
                 {
                     uint32_t target = current_offset + (2 * SAMPLE_RATE);
+
                     if(target >= src_len)
                     {
                         cur_song = (cur_song + 1) % gbfs_total;
                         start_song();
                     }
                     else
-                    {
                         bn::core::direct_audio_set_offset(target);
-                    }
                 }
 
                 if(bn::keypad::right_pressed())
@@ -226,30 +242,28 @@ int main()
             }
         }
 
-        // ---------------- AUTO ADVANCE ----------------
+        // AUTO NEXT
         if(!paused && src_len > 256 && current_offset >= (src_len - 256))
         {
             cur_song = (cur_song + 1) % gbfs_total;
             start_song();
         }
 
-        // ---------------- SCROLL ----------------
+        // SCROLL LOOP
         if(!paused)
         {
             track_scroll_x -= track_scroll_speed;
 
-            if(track_scroll_x < -240)
-            {
-                track_scroll_x += 360;
-            }
-
-            for(int i = 0, size = track_sprites.size(); i < size; ++i)
-            {
+            for(int i = 0; i < track_sprites.size(); ++i)
                 track_sprites[i].set_x(track_base_xs[i] + track_scroll_x);
-            }
+
+            for(int i = 0; i < track_sprites_2.size(); ++i)
+                track_sprites_2[i].set_x(track_base_xs_2[i] + track_scroll_x);
+
+            if(track_scroll_x <= -(text_width + TEXT_GAP))
+                track_scroll_x += (text_width + TEXT_GAP);
         }
 
-        // ---------------- HUD ----------------
         hud_update_frame(select_locked, paused, cur_song, current_offset);
 
         bn::core::update();
