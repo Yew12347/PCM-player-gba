@@ -32,4 +32,4 @@ pip install pillow
 4. run make
 
 # How to use
-use gbfs tool to create gbfs of RAW pcm_s8 files and it will automaticly play them
+use gbfs tool to create gbfs of RAW pcm_s8 files and it will automaticly play them if you are on linux compile it yourself using gcc or smth until i compile em
