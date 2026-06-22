@@ -13,6 +13,12 @@
 // ---------------- CONFIGURATION ----------------
 static constexpr int TEXT_GAP = 64; // Adjust this value to increase/decrease marquee text spacing
 
+// Modes: 
+// 0 = Original DMA Hook
+// 1 = Pure CPU Poll (Main Loop)
+// 2 = Hardware Timer Interrupt Driven (FIFO fed via IRQ)
+static constexpr int AUDIO_MODE = 2; 
+
 // ---------------- STATE ----------------
 static const GBFS_FILE* gbfs = nullptr;
 static const uint8_t* src = nullptr;
@@ -26,7 +32,7 @@ static char current_song_name[64] = {0};
 static bool select_locked = false;
 static bool paused = false;
 
-// Tracks the absolute seek position since direct_audio_play resets the internal counter
+// Tracks the absolute seek position since audio starts reset internal pointers
 static uint32_t current_song_offset = 0; 
 
 // ---------------- UI ----------------
@@ -119,7 +125,7 @@ static void hud_new_song(const char* name)
 }
 
 // ---------------- STATUS ----------------
-static char status_buffer[32];
+static char status_buffer[48];
 
 static void hud_update_frame(bool locked, bool is_paused, int track_index, uint32_t byte_offset)
 {
@@ -128,6 +134,11 @@ static void hud_update_frame(bool locked, bool is_paused, int track_index, uint3
 
     char time_bcd[4];
     decimal_time(time_bcd, byte_offset);
+
+    // Get CPU usage percentage from the last frame
+    int cpu_pct = (bn::core::last_cpu_usage() * 100).integer();
+    if(cpu_pct > 999) 
+        cpu_pct = 999;
 
     char* p = status_buffer;
 
@@ -149,9 +160,50 @@ static void hud_update_frame(bool locked, bool is_paused, int track_index, uint3
     *p++ = time_bcd[2];
     *p++ = time_bcd[3];
 
+    *p++ = ' ';
+    *p++ = ' ';
+    *p++ = 'C';
+    *p++ = 'P';
+    *p++ = 'U';
+    *p++ = ':';
+
+    if(cpu_pct >= 100)
+    {
+        *p++ = '0' + (cpu_pct / 100);
+        *p++ = '0' + ((cpu_pct % 100) / 10);
+        *p++ = '0' + (cpu_pct % 10);
+    }
+    else
+    {
+        *p++ = ' ';
+        *p++ = '0' + (cpu_pct / 10);
+        *p++ = '0' + (cpu_pct % 10);
+    }
+    *p++ = '%';
+
     *p = 0;
 
     text_gen.generate(-110, 65, status_buffer, dynamic_ui_sprites);
+}
+
+// ---------------- ROUTING HELPER ----------------
+static void dispatch_audio_play(const uint8_t* data, uint32_t size)
+{
+    if constexpr (AUDIO_MODE == 2)
+    {
+        // Route to your new custom Interrupt service routine method inside bn_core
+        bn::core::direct_audio_play_irq(data, size); 
+    }
+    else if constexpr (AUDIO_MODE == 1)
+    {
+        // Polled fallback
+        bn::core::direct_audio_play_cpu(data, size);
+    }
+    else
+    {
+        // Traditional hardware DMA
+        bn::core::direct_audio_play(data, size);
+    }
 }
 
 // ---------------- SONG START ----------------
@@ -161,10 +213,12 @@ static void start_song()
 
     hud_new_song(current_song_name);
 
-    current_song_offset = 0; // Reset tracking offset for new song
+    current_song_offset = 0; 
 
     if(src && src_len > 0)
-        bn::core::direct_audio_play(src, src_len);
+    {
+        dispatch_audio_play(src, src_len);
+    }
 }
 
 // ---------------- MAIN ----------------
@@ -191,7 +245,6 @@ int main()
 
     while(true)
     {
-        // Calculate current location as base offset + current relative play progress
         uint32_t current_offset = current_song_offset + bn::core::direct_audio_get_offset();
 
         // INPUT
@@ -227,7 +280,8 @@ int main()
 
                     bn::core::direct_audio_stop();
                     current_song_offset = target;
-                    bn::core::direct_audio_play(src + target, src_len - target);
+
+                    dispatch_audio_play(src + target, src_len - target);
 
                     if(was_paused)
                     {
@@ -257,7 +311,8 @@ int main()
 
                     bn::core::direct_audio_stop();
                     current_song_offset = target;
-                    bn::core::direct_audio_play(src + target, src_len - target);
+
+                    dispatch_audio_play(src + target, src_len - target);
 
                     if(was_paused)
                     {

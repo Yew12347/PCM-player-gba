@@ -230,6 +230,22 @@ namespace bn::core
     void direct_audio_play(const void* data, uint32_t size_bytes);
 
     /**
+     * @brief Alternative CPU-driven FIFO playback streaming engine that completely
+     * drops hardware DMA channel dependencies. Updates sample clusters inside the main loop.
+     * @param data Pointer to raw, 4-byte-aligned linear PCM audio byte array data.
+     * @param size_bytes Total size of data sample array buffer block.
+     */
+    void direct_audio_play_cpu(const void* data, uint32_t size_bytes);
+
+    /**
+     * @brief Alternative Hardware Interrupt-driven driver variant that feeds raw
+     * PCM audio clusters byte-by-byte into the FIFO queue inside an active Timer 0 ISR.
+     * @param data Pointer to raw, 4-byte-aligned linear PCM audio byte array data.
+     * @param size_bytes Total size of data sample array buffer block.
+     */
+    void direct_audio_play_irq(const void* data, uint32_t size_bytes);
+
+    /**
      * @brief Tears down active audio hardware timers and DMA controller channels 
      * associated with the bypassed direct-sound pipeline to halt playback.
      */

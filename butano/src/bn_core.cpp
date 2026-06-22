@@ -5,6 +5,8 @@
  * * Patched to completely bypass internal engine audio management for direct hardware PCM control.
  * * Pre-primes Direct Sound FIFO to guarantee clean first-frame hardware playback.
  * * Formatted to use type-safe libtonc hardware register abstractions.
+ * * Added alternative CPU-driven FIFO mixing implementation to bypass DMA requirements.
+ * * Added dedicated Hardware Timer Interrupt context variant using `bn::hw::irq`.
  */
 
 #include "bn_core.h"
@@ -63,12 +65,12 @@
         #define BN_PROFILER_ENGINE_GENERAL_START(id) \
             do \
             { \
-            } while(false)
+                } while(false)
 
         #define BN_PROFILER_ENGINE_GENERAL_STOP() \
             do \
             { \
-            } while(false)
+                } while(false)
 
         #define BN_PROFILER_ENGINE_DETAILED_START(id) \
             BN_PROFILER_START(id)
@@ -85,33 +87,33 @@
         #define BN_PROFILER_ENGINE_DETAILED_START(id) \
             do \
             { \
-            } while(false)
+                } while(false)
 
         #define BN_PROFILER_ENGINE_DETAILED_STOP() \
             do \
             { \
-            } while(false)
+                } while(false)
     #endif
 #else
     #define BN_PROFILER_ENGINE_GENERAL_START(id) \
         do \
         { \
-        } while(false)
+            } while(false)
 
     #define BN_PROFILER_ENGINE_GENERAL_STOP() \
         do \
         { \
-        } while(false)
+            } while(false)
 
     #define BN_PROFILER_ENGINE_DETAILED_START(id) \
         do \
         { \
-        } while(false)
+            } while(false)
 
     #define BN_PROFILER_ENGINE_DETAILED_STOP() \
         do \
         { \
-        } while(false)
+            } while(false)
 #endif
 
 namespace bn::core
@@ -163,19 +165,56 @@ namespace
     volatile int audio_current_speed = 1;
     volatile bool audio_is_active = false;
     volatile bool audio_is_paused = false;
+    volatile bool audio_use_cpu_mode = false;
+    volatile bool audio_use_irq_mode = false;
 
     // Stride location parameter references tracked across ticks
     volatile int32_t audio_sample_position = 0;
+    volatile uint32_t audio_isr_tick_counter = 0;
+
+    // Fast-path Hardware ISR forced directly into IWRAM running 32-bit ARM instructions
+    __attribute__((section(".iwram.text"), target("arm")))
+    void audio_timer_isr()
+    {
+        if (base_audio_ptr && !audio_is_paused)
+        {
+            // The GBA consumes 1 byte per Timer 0 hit. 
+            // We write a 32-bit word (4 bytes) every 4 hits to keep the FIFO cleanly balanced.
+            if ((audio_isr_tick_counter & 3) == 0)
+            {
+                if (audio_sample_position + 4 <= static_cast<int32_t>(audio_buffer_size))
+                {
+                    uint32_t sample_word = base_audio_ptr[audio_sample_position] |
+                                          (base_audio_ptr[audio_sample_position + 1] << 8) |
+                                          (base_audio_ptr[audio_sample_position + 2] << 16) |
+                                          (base_audio_ptr[audio_sample_position + 3] << 24);
+
+                    REG_FIFO_A = sample_word;
+                }
+            }
+
+            // Track linear timing advancement sequentially
+            audio_sample_position += audio_current_speed;
+            audio_isr_tick_counter++;
+
+            if (audio_sample_position >= static_cast<int32_t>(audio_buffer_size))
+            {
+                audio_sample_position = 0; // Seamless loop wrap
+            }
+        }
+    }
 
     void direct_audio_update()
     {
-        if (!audio_is_active || audio_is_paused || !base_audio_ptr || audio_buffer_size == 0)
+        // Skip updates completely if using pure hardware Timer IRQ engine or inactive
+        if (!audio_is_active || audio_is_paused || !base_audio_ptr || audio_buffer_size == 0 || audio_use_irq_mode)
         {
             return;
         }
 
         // Advance raw address mapping offset by calculations matching current execution speed
-        audio_sample_position += (audio_current_speed * 266); // 16000Hz / ~60 FPS ≈ 266 samples per frame
+        int32_t stride = (audio_current_speed * 266); // 16000Hz / ~60 FPS ≈ 266 samples per frame
+        audio_sample_position += stride;
 
         // Boundary handling check loops
         if (audio_sample_position >= static_cast<int32_t>(audio_buffer_size))
@@ -187,8 +226,25 @@ namespace
             audio_sample_position = static_cast<int32_t>(audio_buffer_size) - 1; // Loop tracking backwards
         }
 
-        // Safely adjust DMA 1 base source address pointer via Tonc macro definition
-        REG_DMA1SAD = (uint32_t)(base_audio_ptr + audio_sample_position);
+        if (audio_use_cpu_mode)
+        {
+            // CPU Mode: Top up FIFO manually during the frame loop step to satisfy threshold capacity
+            if (audio_sample_position + 16 <= static_cast<int32_t>(audio_buffer_size))
+            {
+                auto* fifo_a_32 = const_cast<volatile uint32_t*>(&REG_FIFO_A);
+                const auto* src_words = reinterpret_cast<const uint32_t*>(base_audio_ptr + audio_sample_position);
+                
+                fifo_a_32[0] = src_words[0];
+                fifo_a_32[0] = src_words[1];
+                fifo_a_32[0] = src_words[2];
+                fifo_a_32[0] = src_words[3];
+            }
+        }
+        else
+        {
+            // DMA Mode base address update
+            REG_DMA1SAD = (uint32_t)(base_audio_ptr + audio_sample_position);
+        }
     }
 
     void enable()
@@ -277,7 +333,10 @@ namespace
         bool use_dma = data.dma_enabled && ! link_manager::active();
 
         // PATCH: Ensure audio isn't stealing DMA settings contextually
-        use_dma = use_dma && hw::audio::dma_channel_free(3);
+        if (!audio_use_cpu_mode && !audio_use_irq_mode)
+        {
+            use_dma = use_dma && hw::audio::dma_channel_free(3);
+        }
 
         BN_PROFILER_ENGINE_GENERAL_STOP();
 
@@ -645,10 +704,13 @@ void direct_audio_play(const void* data, uint32_t size_bytes)
     audio_buffer_size = size_bytes;
     audio_is_paused = false;
     audio_is_active = true;
+    audio_use_cpu_mode = false;
+    audio_use_irq_mode = false;
 
     // Clear control/timing registers to stop running states safely
     REG_TM0CNT = 0; 
     REG_DMA1CNT = 0;
+    hw::irq::disable(hw::irq::id::TIMER0);
     
     // Master Sound System Enable
     REG_SOUNDCNT_X = SION_ENABLE; 
@@ -661,15 +723,13 @@ void direct_audio_play(const void* data, uint32_t size_bytes)
     REG_DMA1DAD = (uint32_t)&REG_FIFO_A;
     
     // --- INTRODUCED FIFO PRE-PRIME PATCH ---
-    // Manually push 4 words (16 bytes) into the hardware FIFO register immediately to satisfy initial request.
-    auto* fifo_a_32 = reinterpret_cast<volatile uint32_t*>(&REG_FIFO_A);
+    auto* fifo_a_32 = const_cast<volatile uint32_t*>(&REG_FIFO_A);
     const uint32_t* src_words = reinterpret_cast<const uint32_t*>(data);
     fifo_a_32[0] = src_words[0];
     fifo_a_32[0] = src_words[1];
     fifo_a_32[0] = src_words[2];
     fifo_a_32[0] = src_words[3];
 
-    // Offsets stride position beyond manually consumed bytes to ensure sound waves don't stutter
     audio_sample_position = 16;
     REG_DMA1SAD = (uint32_t)(base_audio_ptr + audio_sample_position);
     // ---------------------------------------
@@ -682,6 +742,83 @@ void direct_audio_play(const void* data, uint32_t size_bytes)
     REG_TM0CNT = TM_ENABLE | TM_FREQ_1;
 }
 
+// ALTERNATIVE CPU-FED FIFO PLAYBACK IMPLEMENTATION
+void direct_audio_play_cpu(const void* data, uint32_t size_bytes)
+{
+    base_audio_ptr = reinterpret_cast<const uint8_t*>(data);
+    audio_buffer_size = size_bytes;
+    audio_is_paused = false;
+    audio_is_active = true;
+    audio_use_cpu_mode = true;
+    audio_use_irq_mode = false;
+
+    // Shut down DMA channel 1 entirely to completely drop hardware DMA dependencies
+    REG_TM0CNT = 0; 
+    REG_DMA1CNT = 0;
+    hw::irq::disable(hw::irq::id::TIMER0);
+    
+    // Turn on global audio systems
+    REG_SOUNDCNT_X = SION_ENABLE; 
+    
+    // Direct Sound A: Enable Left/Right output, flush internal state, tie playback pacing to Timer 0
+    REG_SOUNDCNT_H = SDS_AL | SDS_AR | SDS_ARESET | SDS_ATMR0;
+
+    // Initial manual FIFO blast
+    auto* fifo_a_32 = const_cast<volatile uint32_t*>(&REG_FIFO_A);
+    const uint32_t* src_words = reinterpret_cast<const uint32_t*>(data);
+    fifo_a_32[0] = src_words[0];
+    fifo_a_32[0] = src_words[1];
+    fifo_a_32[0] = src_words[2];
+    fifo_a_32[0] = src_words[3];
+
+    audio_sample_position = 16;
+
+    // Enable hardware Timer 0. The internal `direct_audio_update` loops will continue
+    // to top up the buffer contextually without DMA 1 interception.
+    REG_TM0D = 65536 - 1048; // 16000Hz mapping target
+    REG_TM0CNT = TM_ENABLE | TM_FREQ_1;
+}
+
+// DEDICATED HARDWARE TIMER INTERRUPT DRIVER
+void direct_audio_play_irq(const void* data, uint32_t size_bytes)
+{
+    base_audio_ptr = reinterpret_cast<const uint8_t*>(data);
+    audio_buffer_size = size_bytes;
+    audio_is_paused = false;
+    audio_is_active = true;
+    audio_use_cpu_mode = false;
+    audio_use_irq_mode = true;
+
+    // Break down old running components safely
+    REG_TM0CNT = 0;
+    REG_DMA1CNT = 0;
+
+    // Turn on global audio systems
+    REG_SOUNDCNT_X = SION_ENABLE;
+    
+    // Direct Sound A: Stereo mix processing, flush pipelined registers, track Timer 0
+    REG_SOUNDCNT_H = SDS_AL | SDS_AR | SDS_ARESET | SDS_ATMR0;
+
+    // Pre-prime FIFO queue immediately to avoid a starvation stall on initialization
+    auto* fifo_a_32 = const_cast<volatile uint32_t*>(&REG_FIFO_A);
+    const uint32_t* src_words = reinterpret_cast<const uint32_t*>(data);
+    fifo_a_32[0] = src_words[0];
+    fifo_a_32[0] = src_words[1];
+    fifo_a_32[0] = src_words[2];
+    fifo_a_32[0] = src_words[3];
+
+    audio_sample_position = 16;
+    audio_isr_tick_counter = 0;
+
+    // Assign handler to Butano's underlying low-level interrupt vector matrix safely
+    hw::irq::set_isr(hw::irq::id::TIMER0, audio_timer_isr);
+    hw::irq::enable(hw::irq::id::TIMER0);
+
+    // Run Timer 0: Request Interrupt triggers on overflow + Enable clock ticks
+    REG_TM0D = 65536 - 1048; // Exactly 16000Hz interval
+    REG_TM0CNT = TM_ENABLE | TM_IRQ | TM_FREQ_1;
+}
+
 void direct_audio_stop()
 {
     audio_is_active = false;
@@ -689,9 +826,13 @@ void direct_audio_stop()
     base_audio_ptr = nullptr;
     audio_buffer_size = 0;
     audio_sample_position = 0;
+    audio_isr_tick_counter = 0;
+    audio_use_cpu_mode = false;
+    audio_use_irq_mode = false;
     
     REG_TM0CNT = 0;   // Shut down Timer 0
     REG_DMA1CNT = 0;  // Shut down DMA 1
+    hw::irq::disable(hw::irq::id::TIMER0);
 }
 
 void direct_audio_pause_toggle()
@@ -707,13 +848,27 @@ void direct_audio_pause_toggle()
     {
         REG_TM0CNT = 0;   // Turn off hardware Timer tracking 
         REG_DMA1CNT = 0;  // Turn off running DMA channels
+        if (audio_use_irq_mode)
+        {
+            hw::irq::disable(hw::irq::id::TIMER0);
+        }
     }
     else
     {
-        // Re-align stream block address relative to the frame-calculated sample pointer
-        REG_DMA1SAD = (uint32_t)(base_audio_ptr + audio_sample_position);
-        REG_DMA1CNT = DMA_ENABLE | DMA_REPEAT | DMA_DST_FIXED | DMA_AT_SPECIAL | DMA_32;
-        REG_TM0CNT = TM_ENABLE | TM_FREQ_1;
+        if (audio_use_irq_mode)
+        {
+            hw::irq::enable(hw::irq::id::TIMER0);
+            REG_TM0CNT = TM_ENABLE | TM_IRQ | TM_FREQ_1;
+        }
+        else
+        {
+            if (!audio_use_cpu_mode)
+            {
+                REG_DMA1SAD = (uint32_t)(base_audio_ptr + audio_sample_position);
+                REG_DMA1CNT = DMA_ENABLE | DMA_REPEAT | DMA_DST_FIXED | DMA_AT_SPECIAL | DMA_32;
+            }
+            REG_TM0CNT = TM_ENABLE | TM_FREQ_1;
+        }
     }
 }
 
@@ -748,7 +903,7 @@ void direct_audio_set_offset(uint32_t offset)
         audio_sample_position = static_cast<int32_t>(offset);
     }
     
-    if (audio_is_active && !audio_is_paused && base_audio_ptr)
+    if (audio_is_active && !audio_is_paused && base_audio_ptr && !audio_use_cpu_mode && !audio_use_irq_mode)
     {
         REG_DMA1SAD = (uint32_t)(base_audio_ptr + audio_sample_position);
     }
@@ -806,7 +961,7 @@ void set_dma_enabled(bool dma_enabled)
 
         void set_callback(callback_type callback)
         {
-            core::data_ref().assert_callback = callback;
+            bn::core::data_ref().assert_callback = callback;
         }
     }
 
